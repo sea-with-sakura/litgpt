@@ -45,6 +45,7 @@ two matrices of a lower rank.
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Type, Union
 
 import torch
@@ -215,6 +216,11 @@ class LoRAQKVLinear(LoRALinear):
         """
         super(LoRALinear, self).__init__(r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout)
         self.linear = torch.nn.Linear(in_features, out_features, **kwargs)
+        # 调试相关初始化
+        self.debug_capture_dir: Optional[Path] = None
+        self.debug_layer_idx: int = -1
+        self._debug_step: int = 0
+
         self.head_size = head_size
         self.n_head = n_head
         self.n_query_groups = n_query_groups
@@ -407,6 +413,25 @@ class LoRAQKVLinear(LoRALinear):
             self.lora_B.unsqueeze(-1),  # (256, 2) -> (256, 2, 1)
         ).transpose(-2, -1)  # (64, 4, 64) @ (256, 2, 1) -> (64, 256, 64) -> (64, 64, 256)
         lora = self.zero_pad(after_B) * self.scaling  # (64, 64, 256) after zero_pad (64, 64, 384)
+        if self.debug_capture_dir:
+            try:
+                stage = "prefill" if x.shape[1] > 1 else "decode"
+                fname = self.debug_capture_dir / f"layer{self.debug_layer_idx:02d}_{stage}_step{self._debug_step}.pt"
+                fname.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        "x": x.detach().cpu(),
+                        "qkv_base": pretrained.detach().cpu(),
+                        "qkv_lora": lora.detach().cpu(),
+                        "stage": stage,
+                        "layer_idx": self.debug_layer_idx,
+                        "step": self._debug_step,
+                    },
+                    fname,
+                )
+                self._debug_step += 1
+            except Exception:
+                pass
         return pretrained + lora
 
 
@@ -541,6 +566,7 @@ class CausalSelfAttention(BaseCausalSelfAttention):
             n_head=config.n_head,
             n_query_groups=config.n_query_groups,
         )
+        self.qkv.debug_layer_idx = block_idx
         # output projection
         self.proj = create_lora_linear(
             config,
