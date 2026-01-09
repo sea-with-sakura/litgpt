@@ -456,7 +456,7 @@ class CausalSelfAttention(nn.Module):
         if input_pos is not None:
             if not isinstance(self.kv_cache, KVCache):
                 raise TypeError("You need to call `gpt.set_kv_cache()`")
-            k, v = self.kv_cache(input_pos, k, v)
+            k, v = self.kv_cache(input_pos, k, v) # store new kvcache and return the cached k,v
 
             if self.apply_sliding_window_attention:
                 actual_kv_len = k.size(2)

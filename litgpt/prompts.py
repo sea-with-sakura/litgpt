@@ -226,7 +226,7 @@ class R1Base(PromptStyle):
     ) -> str:
         default_system_prompt = sys_prompt or ""
 
-        bos_token = "<｜begin▁of▁sentence｜>"
+        bos_token = "<｜begin▁of▁sentence｜>"  # noqa: F841
         eos_token = ""
 
         if isinstance(prompt, str):
