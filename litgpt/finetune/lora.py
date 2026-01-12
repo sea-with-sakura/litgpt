@@ -44,6 +44,13 @@ from litgpt.utils import (
     select_sft_generate_example,
 )
 
+try:
+    import swanlab
+
+    SWANLAB_AVAILABLE = True
+except ImportError:
+    SWANLAB_AVAILABLE = False
+
 
 def setup(
     checkpoint_dir: Path,
@@ -78,6 +85,9 @@ def setup(
     logger_name: Literal["wandb", "tensorboard", "csv", "mlflow"] = "csv",
     seed: int = 1337,
     access_token: Optional[str] = None,
+    use_swanlab: bool = False,
+    swanlab_project: str = "sakura-llm-lora",
+    swanlab_experiment: Optional[str] = None,
 ) -> None:
     """Finetune a model using the LoRA method.
 
@@ -175,7 +185,21 @@ def setup(
         check_nvlink_connectivity(fabric)
 
     fabric.launch(
-        main, devices, seed, config, data, checkpoint_dir, out_dir, train, eval, optimizer, num_nodes, precision
+        main,
+        devices,
+        seed,
+        config,
+        data,
+        checkpoint_dir,
+        out_dir,
+        train,
+        eval,
+        optimizer,
+        num_nodes,
+        precision,
+        use_swanlab,
+        swanlab_project,
+        swanlab_experiment,
     )
 
 
@@ -192,8 +216,37 @@ def main(
     optimizer: Union[str, Dict],
     num_nodes: int = 1,
     precision: Optional[str] = None,
+    use_swanlab: bool = False,
+    swanlab_project: str = "sakura-llm-lora",
+    swanlab_experiment: Optional[str] = None,
 ) -> None:
     validate_args(train, eval)
+
+    # Initialize SwanLab
+    swanlab_run = None
+    if use_swanlab and fabric.global_rank == 0:
+        if not SWANLAB_AVAILABLE:
+            fabric.print("Warning: SwanLab requested but not installed. Run: pip install swanlab")
+        else:
+            swanlab_run = swanlab.init(
+                project=swanlab_project,
+                experiment_name=swanlab_experiment or f"lora-r{config.lora_r}-alpha{config.lora_alpha}",
+                config={
+                    "model": config.name,
+                    "lora_r": config.lora_r,
+                    "lora_alpha": config.lora_alpha,
+                    "lora_dropout": config.lora_dropout,
+                    "learning_rate": optimizer.get("init_args", {}).get("lr", 0.0002)
+                    if isinstance(optimizer, dict)
+                    else 0.0002,
+                    "batch_size": train.global_batch_size,
+                    "micro_batch_size": train.micro_batch_size,
+                    "epochs": train.epochs,
+                    "warmup_steps": train.lr_warmup_steps,
+                    "max_seq_length": train.max_seq_length,
+                },
+            )
+            fabric.print("SwanLab initialized successfully")
 
     tokenizer = Tokenizer(checkpoint_dir)
     train_dataloader, val_dataloader = get_dataloaders(fabric, data, tokenizer, train)
@@ -249,6 +302,7 @@ def main(
         train=train,
         eval=eval,
         data=data,
+        swanlab_run=swanlab_run,
     )
 
     training_time = time.perf_counter() - train_time
@@ -261,6 +315,9 @@ def main(
         metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
         fabric.log_dict(metrics)
         fabric.print(f"Final evaluation | val loss: {val_loss.item():.3f} | val ppl: {math.exp(val_loss):.3f}")
+
+        if swanlab_run is not None:
+            swanlab.log({"final/val_loss": val_loss.item(), "final/val_ppl": math.exp(val_loss.item())})
 
     # Save the final LoRA checkpoint at the end of training
     save_path = out_dir / "final" / "lit_model.pth.lora"
@@ -280,6 +337,11 @@ def main(
         )
     fabric.barrier()
 
+    # Finish SwanLab
+    if swanlab_run is not None:
+        swanlab.finish()
+        fabric.print("SwanLab run finished")
+
 
 def fit(
     fabric: L.Fabric,
@@ -295,6 +357,7 @@ def fit(
     eval: EvalArgs,
     data: DataModule,
     num_nodes: int = 1,
+    swanlab_run=None,
 ) -> dict:
     tokenizer = Tokenizer(checkpoint_dir)
     longest_seq_length, longest_seq_ix = get_longest_seq_length(
@@ -398,6 +461,19 @@ def fit(
             )
             fabric.log_dict(metrics, step=iter_num)
 
+            # Log to SwanLab
+            if swanlab_run is not None and fabric.global_rank == 0:
+                swanlab.log(
+                    {
+                        "train/loss": loss,
+                        "train/epoch": float(metrics["epoch"]),
+                        "train/learning_rate": metrics["learning_rate"],
+                        "train/iter_time_ms": metrics["iter_time"] * 1000,
+                        "train/tokens": int(metrics["tokens"]),
+                    },
+                    step=iter_num,
+                )
+
         if not is_accumulating and step_count % eval.interval == 0:
             t0 = time.perf_counter()
             val_loss = validate(fabric, model, val_dataloader, eval)
@@ -415,6 +491,20 @@ def fit(
             )
             metrics = {"val_loss": val_loss_tensor, "val_ppl": math.exp(val_loss_tensor)}
             fabric.log_dict(metrics, step=iter_num)
+
+            # Log to SwanLab - 正确的类型转换
+            if swanlab_run is not None and fabric.global_rank == 0:
+                val_loss_item = val_loss_tensor.item()
+                val_ppl_item = math.exp(val_loss_item)  # math.exp() 接受 float，返回 float
+                swanlab.log(
+                    {
+                        "val/loss": val_loss_item,
+                        "val/ppl": val_ppl_item,
+                        "val/time_ms": val_time_tensor.item() * 1000,
+                    },
+                    step=iter_num,
+                )
+
             fabric.barrier()
 
         if train.save_interval is not None and not is_accumulating and step_count % train.save_interval == 0:
