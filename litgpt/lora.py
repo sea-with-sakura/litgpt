@@ -423,6 +423,7 @@ class LoRAQKVLinear(LoRALinear):
                         "x": x.detach().cpu(),
                         "qkv_base": pretrained.detach().cpu(),
                         "qkv_lora": lora.detach().cpu(),
+                        "lora_A": self.lora_A.detach().cpu(),
                         "stage": stage,
                         "layer_idx": self.debug_layer_idx,
                         "step": self._debug_step,
